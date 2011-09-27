@@ -10,7 +10,9 @@ using namespace std;
 
 namespace
 {
-    char   g_szLastErr[PCAP_ERRBUF_SIZE] = {0};
+    char    g_szLastErr[PCAP_ERRBUF_SIZE] = {0};
+    u_char  g_pMyMAC[ETH_ALEN] = {0};
+    string  g_szMyIP;
 };
 
 #define MY_ASSERT(expr) \
@@ -28,14 +30,19 @@ typedef struct
     u_int8_t    protocolSize;		    /* Length of protocol address.  */
     u_int16_t   opcode;		            /* ARP opcode (command).  */
     u_int8_t    senderMAC[ETH_ALEN];	/* Sender hardware address.  */
-    in_addr     senderIP;		        /* Sender IP address.  */
+    u_int16_t   senderIP[2];		    /* Sender IP address. Now I really hate memory alignments.  */ 
     u_int8_t    targetMAC[ETH_ALEN];	/* Target hardware address.  */
-    in_addr     targetIP;		        /* Target IP address.  */
+    u_int16_t   targetIP[2];		    /* Target IP address.  */
 } ARPPacket;
+
+#define COPY_OR_ZERO(dest, src, len) \
+    if (src) \
+        memcpy(dest, src, len); \
+    else \
+        memset(dest, 0, len);
 
 void WriteARP(u_char* pPacket,
               unsigned int& nPos,
-              u_int16_t totalLen,
               bool bRequest,
               const u_char* pSenderMAC,
               const char* szSenderIP,
@@ -50,17 +57,18 @@ void WriteARP(u_char* pPacket,
     pARP->protocolSize  = 0x04;
     pARP->opcode        = htons(bRequest?0x0001:0x0002);
     
-    memcpy(pARP->senderMAC, pSenderMAC, ETH_ALEN * sizeof(u_char));
+    COPY_OR_ZERO(pARP->senderMAC, pSenderMAC, ETH_ALEN * sizeof(u_char));
     
-    in_addr senderIPAddr;
-    inet_aton(szSenderIP, &senderIPAddr);
-    pARP->senderIP      = senderIPAddr;
+    printf("Sender=%s\n", szSenderIP);
+    in_addr senderAddr;
+    inet_aton(szSenderIP, &senderAddr);
+    memcpy(pARP->senderIP, &senderAddr, sizeof(in_addr));
     
-    memcpy(pARP->targetMAC, pTargetMAC, ETH_ALEN * sizeof(u_char));
+    COPY_OR_ZERO(pARP->targetMAC, pTargetMAC, ETH_ALEN * sizeof(u_char));
     
-    in_addr targetIPAddr;
-    inet_aton(szTargetIP, &targetIPAddr);
-    pARP->targetIP      = targetIPAddr;
+    in_addr targetAddr;
+    inet_aton(szTargetIP, &targetAddr);
+    memcpy(pARP->targetIP, &targetAddr, sizeof(in_addr));
     
     nPos += sizeof(ARPPacket);
 }             
@@ -72,11 +80,77 @@ void WriteEthernet(u_char* pPacket,
 {
     ether_header* pEth = reinterpret_cast<ether_header*>(pPacket+nPos);
     
-    memcpy(pEth->ether_dhost, pDst, ETH_ALEN * sizeof(u_char));
-    memcpy(pEth->ether_shost, pSrc, ETH_ALEN * sizeof(u_char));
-    pEth->ether_type = htons(0x0800);
+    COPY_OR_ZERO(pEth->ether_dhost, pDst, ETH_ALEN * sizeof(u_char));
+    COPY_OR_ZERO(pEth->ether_shost, pSrc, ETH_ALEN * sizeof(u_char));
+    pEth->ether_type = htons(0x0806);
     
     nPos += sizeof(ether_header);
+}
+
+int CreateARPPacket(bool bRequest,
+                    const u_char* pSenderMAC,
+                    const string& szSenderIP,
+                    const u_char* pTargetMAC,
+                    const string& szTargetIP,
+                    u_char** pOutPacket, uint16_t& uOutPacketSize)
+{
+    try
+    {
+        u_int16_t uPacketSize = sizeof(ether_header) + sizeof(ARPPacket);
+        u_char* pPacket = new u_char[uPacketSize+1];
+        MY_ASSERT(pPacket);
+        memset(pPacket, 0, (uPacketSize+1) * sizeof(u_char));
+        
+        unsigned int nOutPos=0;
+        
+        WriteEthernet(pPacket, nOutPos,
+                      pTargetMAC,
+                      g_pMyMAC);
+        
+        WriteARP(pPacket, nOutPos,
+                 bRequest,
+                 pSenderMAC,
+                 szSenderIP.c_str(),
+                 pTargetMAC,
+                 szTargetIP.c_str());
+                 
+        *pOutPacket = pPacket;
+        uOutPacketSize = uPacketSize;
+    }
+    catch (...)
+    {
+        printf("Exception occurred in %s\n", __FUNCTION__);
+        return -2;
+    }
+}
+
+int InjectARPPacket(pcap_t* handle,
+                    bool bRequest,
+                    const u_char* pSenderMAC,
+                    const string& szSenderIP,
+                    const u_char* pTargetMAC,
+                    const string& szTargetIP)
+{
+    u_char* pARPPacket = NULL;
+    u_int16_t uPacketSize = 0;
+    CreateARPPacket(bRequest, pSenderMAC, szSenderIP, pTargetMAC, szTargetIP, &pARPPacket, uPacketSize);
+    
+    pcap_inject(handle, reinterpret_cast<void*>(pARPPacket), uPacketSize);
+    
+    printf("ARP packet injected.\n");
+}
+
+inline int SendARPRequest(pcap_t* handle, const string& szIP)
+{
+    return InjectARPPacket(handle, true, g_pMyMAC, g_szMyIP, NULL, szIP);
+}
+
+inline int SendARPReply(pcap_t* handle,
+                        const string& szClaimIP,
+                        const u_char* pDestMAC,
+                        const string& szDestIP)
+{
+    return InjectARPPacket(handle, false, g_pMyMAC, szClaimIP, pDestMAC, szDestIP);
 }
 
 int main(int argc, char** argv)
@@ -110,7 +184,16 @@ int main(int argc, char** argv)
     bpf_u_int32 mask;
     MY_ASSERT(pcap_lookupnet(szDevice, &net, &mask, g_szLastErr) != -1);
     
+    in_addr myIPAddr;
+    myIPAddr.s_addr = net;
+    g_szMyIP = string(inet_ntoa(myIPAddr));
+    printf("I am %s\n", g_szMyIP.c_str());
+    
     pcap_t* handle = pcap_open_live(szDevice, BUFSIZ, 1, -1, g_szLastErr);
     MY_ASSERT(handle);
+    
+    SendARPRequest(handle, szVictimIP);
+    
+    return 0;
 }
 
