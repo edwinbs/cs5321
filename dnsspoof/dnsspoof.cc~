@@ -293,7 +293,7 @@ int main(int argc, char** argv)
     const char* szDestIP   = argv[2];
     const char* szDevice   = NULL;
     
-    for (uint8_t i=3; i<argc; i++)
+    for (uint8_t i=2; i<argc; i++)
     {
         if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--device") == 0)
             szDevice = argv[++i];
